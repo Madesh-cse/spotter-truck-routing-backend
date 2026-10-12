@@ -7,6 +7,7 @@ from app.core.config import settings
 from app.api.checkpoints import router as checkpoints_router
 from app.api.weather import router as weather_router
 from app.api.geocoding import router as geocoding_router
+from app.api.ai_assistant import router as ai_assistant_router
 
 app = FastAPI(
     title=settings.app_name,
@@ -29,6 +30,7 @@ app.include_router(routes_router)
 app.include_router(checkpoints_router)
 app.include_router(weather_router)
 app.include_router(geocoding_router)
+app.include_router(ai_assistant_router)
 
 
 @app.get("/")

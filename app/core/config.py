@@ -1,10 +1,15 @@
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     app_name: str = "Spotter Weather-Aware Truck Routing API"
     debug: bool = True
+
     ors_api_key: str = ""
+
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4.1-mini"
 
     model_config = SettingsConfigDict(
         env_file=".env",

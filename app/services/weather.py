@@ -135,7 +135,7 @@ async def get_checkpoint_weather(
     target_hour = to_utc_hour(eta)
     data = await get_hourly_forecast(latitude, longitude)
 
-    hourly = data["hourly"]
+    hourly = data.get("hourly", {})
     times = hourly.get("time", [])
 
     if not times:
@@ -143,22 +143,64 @@ async def get_checkpoint_weather(
             "Open-Meteo returned an empty hourly forecast."
         )
 
-    # Find the closest available forecast hour to the checkpoint ETA.
-    target_string = target_hour.strftime("%Y-%m-%dT%H:%M")
-    try:
-        index = times.index(target_string)
-    except ValueError:
+    # Parse available forecast timestamps as UTC.
+    available_hours = []
+    for index, value in enumerate(times):
+        try:
+            forecast_hour = datetime.strptime(
+                value, "%Y-%m-%dT%H:%M"
+            ).replace(tzinfo=timezone.utc)
+            available_hours.append((forecast_hour, index))
+        except (TypeError, ValueError):
+            continue
+
+    if not available_hours:
         raise WeatherServiceError(
-            f"No forecast available for {target_string} UTC. "
-            "The ETA may be outside the forecast window."
+            "Open-Meteo returned no valid hourly timestamps."
+        )
+
+    # Reject ETAs outside the forecast range. Do not use stale
+    # weather data for checkpoints beyond the available window.
+    first_hour = available_hours[0][0]
+    last_hour = available_hours[-1][0]
+
+    if target_hour < first_hour or target_hour > last_hour:
+        raise WeatherServiceError(
+            f"Checkpoint ETA {target_hour:%Y-%m-%dT%H:%M} UTC "
+            f"is outside the available forecast window "
+            f"({first_hour:%Y-%m-%dT%H:%M} to "
+            f"{last_hour:%Y-%m-%dT%H:%M} UTC). "
+            "Choose a departure time within the forecast window."
+        )
+
+    # Select the nearest available forecast hour.
+    forecast_hour, index = min(
+        available_hours,
+        key=lambda item: abs(
+            (item[0] - target_hour).total_seconds()
+        ),
+    )
+
+    # Guard against unexpected gaps in hourly data.
+    difference_minutes = abs(
+        (forecast_hour - target_hour).total_seconds()
+    ) / 60
+
+    if difference_minutes > 60:
+        raise WeatherServiceError(
+            f"No suitable hourly forecast exists near "
+            f"{target_hour:%Y-%m-%dT%H:%M} UTC."
         )
 
     def number_at(field: str) -> float:
         values = hourly.get(field, [])
+
         if index >= len(values) or values[index] is None:
             raise WeatherServiceError(
-                f"Weather field '{field}' is unavailable."
+                f"Weather field '{field}' is unavailable "
+                f"for {forecast_hour:%Y-%m-%dT%H:%M} UTC."
             )
+
         return float(values[index])
 
     wind_kmh = number_at("wind_speed_10m")
@@ -167,9 +209,7 @@ async def get_checkpoint_weather(
 
     return {
         "checkpoint_id": checkpoint_id,
-        "forecast_time": datetime.strptime(
-            target_string, "%Y-%m-%dT%H:%M"
-        ).replace(tzinfo=timezone.utc),
+        "forecast_time": forecast_hour,
         "eta": eta,
         "wind_mph": round(wind_kmh / 1.609344, 2),
         "precipitation_in_hr": round(
