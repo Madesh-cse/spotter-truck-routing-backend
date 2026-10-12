@@ -2,14 +2,27 @@
 import asyncio
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
-# Cache hourly forecast responses for 15 minutes.
 CACHE_TTL_SECONDS = 900
-_weather_cache: dict[tuple[float, float], tuple[float, dict]] = {}
+MAX_ATTEMPTS = 3
+MAX_RETRY_DELAY_SECONDS = 30
+REQUEST_TIMEOUT_SECONDS = 20.0
+
+_weather_cache: dict[
+    tuple[float, float],
+    tuple[float, dict],
+] = {}
+
+_inflight_requests: dict[
+    tuple[float, float],
+    asyncio.Task,
+] = {}
+
 _cache_lock = asyncio.Lock()
 
 
@@ -32,17 +45,45 @@ def to_utc_hour(value: datetime) -> datetime:
     return value
 
 
+def _retry_delay(
+    response: httpx.Response,
+    attempt: int,
+) -> float:
+    retry_after = response.headers.get("Retry-After")
 
-async def get_hourly_forecast(
-    latitude: float,
-    longitude: float,
+    if retry_after:
+        try:
+            return min(
+                max(float(retry_after), 0.0),
+                MAX_RETRY_DELAY_SECONDS,
+            )
+        except ValueError:
+            try:
+                retry_time = parsedate_to_datetime(retry_after)
+
+                if retry_time.tzinfo is None:
+                    retry_time = retry_time.replace(
+                        tzinfo=timezone.utc
+                    )
+
+                delay = (
+                    retry_time - datetime.now(timezone.utc)
+                ).total_seconds()
+
+                return min(
+                    max(delay, 0.0),
+                    MAX_RETRY_DELAY_SECONDS,
+                )
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+    return min(2 ** attempt, MAX_RETRY_DELAY_SECONDS)
+
+
+async def _fetch_and_cache(
+    key: tuple[float, float],
 ) -> dict:
-    key = (round(latitude, 3), round(longitude, 3))
-
-    async with _cache_lock:
-        cached = _weather_cache.get(key)
-        if cached and time.monotonic() - cached[0] < CACHE_TTL_SECONDS:
-            return cached[1]
+    latitude, longitude = key
 
     params = {
         "latitude": latitude,
@@ -54,11 +95,12 @@ async def get_hourly_forecast(
     }
 
     retryable_statuses = {429, 500, 502, 503, 504}
-    max_attempts = 3
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            for attempt in range(max_attempts):
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS
+        ) as client:
+            for attempt in range(MAX_ATTEMPTS):
                 try:
                     response = await client.get(
                         OPEN_METEO_URL,
@@ -67,9 +109,11 @@ async def get_hourly_forecast(
 
                     if (
                         response.status_code in retryable_statuses
-                        and attempt < max_attempts - 1
+                        and attempt < MAX_ATTEMPTS - 1
                     ):
-                        await asyncio.sleep(0.75 * (2 ** attempt))
+                        await asyncio.sleep(
+                            _retry_delay(response, attempt)
+                        )
                         continue
 
                     response.raise_for_status()
@@ -81,9 +125,11 @@ async def get_hourly_forecast(
 
                     if (
                         status_code in retryable_statuses
-                        and attempt < max_attempts - 1
+                        and attempt < MAX_ATTEMPTS - 1
                     ):
-                        await asyncio.sleep(0.75 * (2 ** attempt))
+                        await asyncio.sleep(
+                            _retry_delay(exc.response, attempt)
+                        )
                         continue
 
                     raise WeatherServiceError(
@@ -92,13 +138,15 @@ async def get_hourly_forecast(
                     ) from exc
 
                 except httpx.RequestError as exc:
-                    if attempt < max_attempts - 1:
-                        await asyncio.sleep(0.75 * (2 ** attempt))
+                    if attempt < MAX_ATTEMPTS - 1:
+                        await asyncio.sleep(
+                            min(2 ** attempt, 8)
+                        )
                         continue
 
                     raise WeatherServiceError(
                         "Unable to connect to Open-Meteo after "
-                        f"{max_attempts} attempts."
+                        f"{MAX_ATTEMPTS} attempts."
                     ) from exc
 
             else:
@@ -111,16 +159,60 @@ async def get_hourly_forecast(
             "Unable to connect to Open-Meteo."
         ) from exc
 
-    if "hourly" not in data:
+    if not isinstance(data, dict) or "hourly" not in data:
         raise WeatherServiceError(
             "Open-Meteo returned no hourly forecast."
         )
 
     async with _cache_lock:
-        _weather_cache[key] = (time.monotonic(), data)
+        now = time.monotonic()
+
+        # Remove expired cache entries.
+        expired_keys = [
+            cache_key
+            for cache_key, (created_at, _) in _weather_cache.items()
+            if now - created_at >= CACHE_TTL_SECONDS
+        ]
+
+        for cache_key in expired_keys:
+            _weather_cache.pop(cache_key, None)
+
+        _weather_cache[key] = (now, data)
 
     return data
 
+
+async def get_hourly_forecast(
+    latitude: float,
+    longitude: float,
+) -> dict:
+    key = (round(latitude, 3), round(longitude, 3))
+
+    async with _cache_lock:
+        cached = _weather_cache.get(key)
+
+        if cached:
+            created_at, data = cached
+
+            if time.monotonic() - created_at < CACHE_TTL_SECONDS:
+                return data
+
+            _weather_cache.pop(key, None)
+
+        # Reuse an existing request for the same coordinates.
+        task = _inflight_requests.get(key)
+
+        if task is None:
+            task = asyncio.create_task(_fetch_and_cache(key))
+            _inflight_requests[key] = task
+
+    try:
+        # Shield the shared request from cancellation by one caller.
+        return await asyncio.shield(task)
+    finally:
+        async with _cache_lock:
+            if _inflight_requests.get(key) is task and task.done():
+                _inflight_requests.pop(key, None)
 
 
 async def get_checkpoint_weather(
@@ -133,7 +225,11 @@ async def get_checkpoint_weather(
         raise ValueError("Checkpoint ETA must include a timezone.")
 
     target_hour = to_utc_hour(eta)
-    data = await get_hourly_forecast(latitude, longitude)
+
+    data = await get_hourly_forecast(
+        latitude=latitude,
+        longitude=longitude,
+    )
 
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])
@@ -143,14 +239,17 @@ async def get_checkpoint_weather(
             "Open-Meteo returned an empty hourly forecast."
         )
 
-    # Parse available forecast timestamps as UTC.
     available_hours = []
+
     for index, value in enumerate(times):
         try:
             forecast_hour = datetime.strptime(
-                value, "%Y-%m-%dT%H:%M"
+                value,
+                "%Y-%m-%dT%H:%M",
             ).replace(tzinfo=timezone.utc)
+
             available_hours.append((forecast_hour, index))
+
         except (TypeError, ValueError):
             continue
 
@@ -159,8 +258,6 @@ async def get_checkpoint_weather(
             "Open-Meteo returned no valid hourly timestamps."
         )
 
-    # Reject ETAs outside the forecast range. Do not use stale
-    # weather data for checkpoints beyond the available window.
     first_hour = available_hours[0][0]
     last_hour = available_hours[-1][0]
 
@@ -173,7 +270,6 @@ async def get_checkpoint_weather(
             "Choose a departure time within the forecast window."
         )
 
-    # Select the nearest available forecast hour.
     forecast_hour, index = min(
         available_hours,
         key=lambda item: abs(
@@ -181,7 +277,6 @@ async def get_checkpoint_weather(
         ),
     )
 
-    # Guard against unexpected gaps in hourly data.
     difference_minutes = abs(
         (forecast_hour - target_hour).total_seconds()
     ) / 60
@@ -201,7 +296,21 @@ async def get_checkpoint_weather(
                 f"for {forecast_hour:%Y-%m-%dT%H:%M} UTC."
             )
 
-        return float(values[index])
+        try:
+            value = float(values[index])
+        except (TypeError, ValueError) as exc:
+            raise WeatherServiceError(
+                f"Weather field '{field}' contains invalid data "
+                f"for {forecast_hour:%Y-%m-%dT%H:%M} UTC."
+            ) from exc
+
+        if not (float("-inf") < value < float("inf")):
+            raise WeatherServiceError(
+                f"Weather field '{field}' contains a non-finite "
+                f"value for {forecast_hour:%Y-%m-%dT%H:%M} UTC."
+            )
+
+        return value
 
     wind_kmh = number_at("wind_speed_10m")
     precipitation_mm = number_at("precipitation")
@@ -215,5 +324,7 @@ async def get_checkpoint_weather(
         "precipitation_in_hr": round(
             precipitation_mm / 25.4, 4
         ),
-        "snowfall_in_hr": round(snowfall_cm / 2.54, 4),
+        "snowfall_in_hr": round(
+            snowfall_cm / 2.54, 4
+        ),
     }

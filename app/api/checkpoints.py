@@ -32,7 +32,7 @@ from app.services.weather import (
 router = APIRouter(prefix="/api/v1/routes", tags=["Checkpoints"])
 
 MAX_WEATHER_CHECKPOINTS = 200
-WEATHER_CONCURRENCY = 10
+WEATHER_CONCURRENCY = 2
 
 
 @router.post("/plan", response_model=CheckpointPlanResponse)
