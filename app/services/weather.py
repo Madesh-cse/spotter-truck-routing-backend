@@ -12,6 +12,7 @@ CACHE_TTL_SECONDS = 900
 MAX_ATTEMPTS = 3
 MAX_RETRY_DELAY_SECONDS = 30
 REQUEST_TIMEOUT_SECONDS = 20.0
+BATCH_SIZE = 10
 
 _weather_cache: dict[
     tuple[float, float],
@@ -24,10 +25,18 @@ _inflight_requests: dict[
 ] = {}
 
 _cache_lock = asyncio.Lock()
+_batch_lock = asyncio.Lock()
 
 
 class WeatherServiceError(Exception):
     pass
+
+
+def _coordinate_key(
+    latitude: float,
+    longitude: float,
+) -> tuple[float, float]:
+    return round(latitude, 3), round(longitude, 3)
 
 
 def to_utc_hour(value: datetime) -> datetime:
@@ -80,14 +89,13 @@ def _retry_delay(
     return min(2 ** attempt, MAX_RETRY_DELAY_SECONDS)
 
 
-async def _fetch_and_cache(
-    key: tuple[float, float],
-) -> dict:
-    latitude, longitude = key
-
+async def _request_forecasts(
+    client: httpx.AsyncClient,
+    coordinates: list[tuple[float, float]],
+) -> list[dict]:
     params = {
-        "latitude": latitude,
-        "longitude": longitude,
+        "latitude": ",".join(str(lat) for lat, _ in coordinates),
+        "longitude": ",".join(str(lon) for _, lon in coordinates),
         "hourly": "wind_speed_10m,precipitation,snowfall",
         "wind_speed_unit": "kmh",
         "forecast_days": 7,
@@ -96,87 +104,100 @@ async def _fetch_and_cache(
 
     retryable_statuses = {429, 500, 502, 503, 504}
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=REQUEST_TIMEOUT_SECONDS
-        ) as client:
-            for attempt in range(MAX_ATTEMPTS):
-                try:
-                    response = await client.get(
-                        OPEN_METEO_URL,
-                        params=params,
-                    )
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            response = await client.get(
+                OPEN_METEO_URL,
+                params=params,
+            )
 
-                    if (
-                        response.status_code in retryable_statuses
-                        and attempt < MAX_ATTEMPTS - 1
-                    ):
-                        await asyncio.sleep(
-                            _retry_delay(response, attempt)
-                        )
-                        continue
+            if (
+                response.status_code in retryable_statuses
+                and attempt < MAX_ATTEMPTS - 1
+            ):
+                await asyncio.sleep(
+                    _retry_delay(response, attempt)
+                )
+                continue
 
-                    response.raise_for_status()
-                    data = response.json()
-                    break
+            response.raise_for_status()
 
-                except httpx.HTTPStatusError as exc:
-                    status_code = exc.response.status_code
-
-                    if (
-                        status_code in retryable_statuses
-                        and attempt < MAX_ATTEMPTS - 1
-                    ):
-                        await asyncio.sleep(
-                            _retry_delay(exc.response, attempt)
-                        )
-                        continue
-
-                    raise WeatherServiceError(
-                        f"Open-Meteo returned HTTP {status_code} "
-                        f"after {attempt + 1} attempt(s)."
-                    ) from exc
-
-                except httpx.RequestError as exc:
-                    if attempt < MAX_ATTEMPTS - 1:
-                        await asyncio.sleep(
-                            min(2 ** attempt, 8)
-                        )
-                        continue
-
-                    raise WeatherServiceError(
-                        "Unable to connect to Open-Meteo after "
-                        f"{MAX_ATTEMPTS} attempts."
-                    ) from exc
-
-            else:
+            try:
+                data = response.json()
+            except ValueError as exc:
                 raise WeatherServiceError(
-                    "Open-Meteo did not return a forecast."
+                    "Open-Meteo returned invalid JSON."
+                ) from exc
+
+            forecasts = data if isinstance(data, list) else [data]
+
+            if len(forecasts) != len(coordinates):
+                raise WeatherServiceError(
+                    "Open-Meteo returned an unexpected number "
+                    "of forecasts for the requested coordinates."
                 )
 
-    except httpx.RequestError as exc:
-        raise WeatherServiceError(
-            "Unable to connect to Open-Meteo."
-        ) from exc
+            for forecast in forecasts:
+                if (
+                    not isinstance(forecast, dict)
+                    or not isinstance(forecast.get("hourly"), dict)
+                ):
+                    raise WeatherServiceError(
+                        "Open-Meteo returned an invalid hourly forecast."
+                    )
 
-    if not isinstance(data, dict) or "hourly" not in data:
-        raise WeatherServiceError(
-            "Open-Meteo returned no hourly forecast."
-        )
+            return forecasts
+
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+
+            if (
+                status_code in retryable_statuses
+                and attempt < MAX_ATTEMPTS - 1
+            ):
+                await asyncio.sleep(
+                    _retry_delay(exc.response, attempt)
+                )
+                continue
+
+            if status_code == 429:
+                raise WeatherServiceError(
+                    "Open-Meteo rate limit reached after "
+                    f"{attempt + 1} attempt(s)."
+                ) from exc
+
+            raise WeatherServiceError(
+                f"Open-Meteo returned HTTP {status_code} "
+                f"after {attempt + 1} attempt(s)."
+            ) from exc
+
+        except httpx.RequestError as exc:
+            if attempt < MAX_ATTEMPTS - 1:
+                await asyncio.sleep(min(2 ** attempt, 8))
+                continue
+
+            raise WeatherServiceError(
+                "Unable to connect to Open-Meteo after "
+                f"{MAX_ATTEMPTS} attempts."
+            ) from exc
+
+    raise WeatherServiceError(
+        "Open-Meteo did not return a forecast."
+    )
+
+
+async def _fetch_and_cache(
+    key: tuple[float, float],
+) -> dict:
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT_SECONDS
+    ) as client:
+        forecasts = await _request_forecasts(client, [key])
+
+    data = forecasts[0]
 
     async with _cache_lock:
         now = time.monotonic()
-
-        # Remove expired cache entries.
-        expired_keys = [
-            cache_key
-            for cache_key, (created_at, _) in _weather_cache.items()
-            if now - created_at >= CACHE_TTL_SECONDS
-        ]
-
-        for cache_key in expired_keys:
-            _weather_cache.pop(cache_key, None)
-
         _weather_cache[key] = (now, data)
 
     return data
@@ -186,7 +207,7 @@ async def get_hourly_forecast(
     latitude: float,
     longitude: float,
 ) -> dict:
-    key = (round(latitude, 3), round(longitude, 3))
+    key = _coordinate_key(latitude, longitude)
 
     async with _cache_lock:
         cached = _weather_cache.get(key)
@@ -199,7 +220,6 @@ async def get_hourly_forecast(
 
             _weather_cache.pop(key, None)
 
-        # Reuse an existing request for the same coordinates.
         task = _inflight_requests.get(key)
 
         if task is None:
@@ -207,7 +227,6 @@ async def get_hourly_forecast(
             _inflight_requests[key] = task
 
     try:
-        # Shield the shared request from cancellation by one caller.
         return await asyncio.shield(task)
     finally:
         async with _cache_lock:
@@ -215,21 +234,93 @@ async def get_hourly_forecast(
                 _inflight_requests.pop(key, None)
 
 
+async def get_hourly_forecasts_batch(
+    coordinates: list[tuple[float, float]],
+) -> dict[tuple[float, float], dict]:
+    keys = list(
+        dict.fromkeys(
+            _coordinate_key(latitude, longitude)
+            for latitude, longitude in coordinates
+        )
+    )
+
+    results: dict[tuple[float, float], dict] = {}
+
+    if not keys:
+        return results
+
+    # Serialize batch calls to avoid duplicate requests from this service.
+    async with _batch_lock:
+        now = time.monotonic()
+
+        async with _cache_lock:
+            expired_keys = [
+                key
+                for key, (created_at, _) in _weather_cache.items()
+                if now - created_at >= CACHE_TTL_SECONDS
+            ]
+
+            for key in expired_keys:
+                _weather_cache.pop(key, None)
+
+            for key in keys:
+                cached = _weather_cache.get(key)
+
+                if cached:
+                    results[key] = cached[1]
+
+        missing = [key for key in keys if key not in results]
+
+        if not missing:
+            return results
+
+        async with httpx.AsyncClient(
+            timeout=REQUEST_TIMEOUT_SECONDS
+        ) as client:
+            for start in range(0, len(missing), BATCH_SIZE):
+                batch = missing[start:start + BATCH_SIZE]
+
+                forecasts = await _request_forecasts(
+                    client,
+                    batch,
+                )
+
+                cached_at = time.monotonic()
+
+                async with _cache_lock:
+                    for key, forecast in zip(
+                        batch,
+                        forecasts,
+                        strict=True,
+                    ):
+                        _weather_cache[key] = (
+                            cached_at,
+                            forecast,
+                        )
+                        results[key] = forecast
+
+    return results
+
+
 async def get_checkpoint_weather(
     checkpoint_id: str,
     latitude: float,
     longitude: float,
     eta: datetime,
+    forecast_data: dict | None = None,
 ) -> dict:
     if eta.tzinfo is None:
         raise ValueError("Checkpoint ETA must include a timezone.")
 
     target_hour = to_utc_hour(eta)
 
-    data = await get_hourly_forecast(
-        latitude=latitude,
-        longitude=longitude,
-    )
+    if forecast_data is None:
+        data = await get_hourly_forecast(
+            latitude=latitude,
+            longitude=longitude,
+        )
+    else:
+        data = forecast_data
 
     hourly = data.get("hourly", {})
     times = hourly.get("time", [])

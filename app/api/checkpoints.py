@@ -27,12 +27,15 @@ from app.services.routing import (
 from app.services.weather import (
     WeatherServiceError,
     get_checkpoint_weather,
+    get_hourly_forecasts_batch,
 )
 
-router = APIRouter(prefix="/api/v1/routes", tags=["Checkpoints"])
+router = APIRouter(
+    prefix="/api/v1/routes",
+    tags=["Checkpoints"],
+)
 
 MAX_WEATHER_CHECKPOINTS = 200
-WEATHER_CONCURRENCY = 2
 
 
 @router.post("/plan", response_model=CheckpointPlanResponse)
@@ -56,12 +59,14 @@ async def create_route_plan(
             destination=request.destination,
         )
 
-        route_response = await get_alternative_routes(route_request)
+        route_response = await get_alternative_routes(
+            route_request
+        )
 
         sampled_routes = []
         total_checkpoints = 0
 
-        # Generate checkpoints using the selected forecast time.
+        # Generate checkpoints for every alternative route.
         for route in route_response.routes:
             checkpoints = sample_checkpoints(
                 geometry=route.geometry,
@@ -74,35 +79,67 @@ async def create_route_plan(
             total_checkpoints += len(checkpoints)
             sampled_routes.append((route, checkpoints))
 
-        # Protect the weather provider from oversized requests.
+        # Protect the weather provider from oversized plans.
         if total_checkpoints > MAX_WEATHER_CHECKPOINTS:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"The selected interval produces {total_checkpoints} "
-                    f"checkpoints across all routes. The current limit is "
-                    f"{MAX_WEATHER_CHECKPOINTS}. Choose a larger interval."
+                    f"The selected interval produces "
+                    f"{total_checkpoints} checkpoints across "
+                    f"all routes. The current limit is "
+                    f"{MAX_WEATHER_CHECKPOINTS}. "
+                    "Choose a larger interval."
                 ),
             )
 
-        semaphore = asyncio.Semaphore(WEATHER_CONCURRENCY)
+        # Collect coordinates from all routes.
+        all_checkpoints = [
+            checkpoint
+            for _, checkpoints in sampled_routes
+            for checkpoint in checkpoints
+        ]
+
+        # Fetch and cache forecasts in batches.
+        forecasts = await get_hourly_forecasts_batch([
+            (
+                checkpoint.latitude,
+                checkpoint.longitude,
+            )
+            for checkpoint in all_checkpoints
+        ])
 
         async def fetch_weather(checkpoint):
-            async with semaphore:
-                return await get_checkpoint_weather(
-                    checkpoint_id=checkpoint.checkpoint_id,
-                    latitude=checkpoint.latitude,
-                    longitude=checkpoint.longitude,
-                    eta=checkpoint.eta,
+            key = (
+                round(checkpoint.latitude, 3),
+                round(checkpoint.longitude, 3),
+            )
+
+            forecast_data = forecasts.get(key)
+
+            if forecast_data is None:
+                raise WeatherServiceError(
+                    "No forecast was returned for checkpoint "
+                    f"{checkpoint.checkpoint_id}."
                 )
+
+            return await get_checkpoint_weather(
+                checkpoint_id=checkpoint.checkpoint_id,
+                latitude=checkpoint.latitude,
+                longitude=checkpoint.longitude,
+                eta=checkpoint.eta,
+                forecast_data=forecast_data,
+            )
 
         enriched_routes = []
         recommendation_inputs = []
 
-        # Retrieve weather and classify checkpoint risk.
+        # Process each route using the fetched forecasts.
         for route, checkpoints in sampled_routes:
             weather_results = await asyncio.gather(
-                *(fetch_weather(checkpoint) for checkpoint in checkpoints)
+                *(
+                    fetch_weather(checkpoint)
+                    for checkpoint in checkpoints
+                )
             )
 
             planned_checkpoints = []
@@ -118,18 +155,22 @@ async def create_route_plan(
                     CheckpointRiskInput(
                         checkpoint_id=checkpoint.checkpoint_id,
                         wind_mph=weather.wind_mph,
-                        precipitation_in_hr=weather.precipitation_in_hr,
+                        precipitation_in_hr=(
+                            weather.precipitation_in_hr
+                        ),
                         snowfall_in_hr=weather.snowfall_in_hr,
                         load_weight_lb=request.load_weight_lb,
                     )
                 )
 
+                planned_checkpoint = PlannedCheckpoint(
+                    **checkpoint.model_dump(),
+                    weather=weather,
+                    risk=risk,
+                )
+
                 planned_checkpoints.append(
-                    PlannedCheckpoint(
-                        **checkpoint.model_dump(),
-                        weather=weather,
-                        risk=risk,
-                    )
+                    planned_checkpoint
                 )
 
             recommendation_inputs.append(
@@ -153,7 +194,7 @@ async def create_route_plan(
                 }
             )
 
-        # Rank routes using risk first, then travel duration.
+        # Rank routes by risk and travel duration.
         summaries = rank_routes(recommendation_inputs)
 
         summaries_by_id = {
@@ -165,7 +206,10 @@ async def create_route_plan(
 
         for item in enriched_routes:
             route = item["route"]
-            summary: RouteRiskSummary = summaries_by_id[route.route_id]
+
+            summary: RouteRiskSummary = summaries_by_id[
+                route.route_id
+            ]
 
             planned_routes.append(
                 PlannedRoute(
@@ -182,7 +226,7 @@ async def create_route_plan(
             key=lambda route: route.risk_summary.rank
         )
 
-        # No-travel routes are not recommended.
+        # Do not recommend a route marked unsafe for travel.
         recommended_route_id = next(
             (
                 route.route_id
@@ -195,7 +239,9 @@ async def create_route_plan(
         return CheckpointPlanResponse(
             departure_time=effective_departure_time,
             forecast_offset_hours=request.forecast_offset_hours,
-            checkpoint_interval_miles=request.checkpoint_interval_miles,
+            checkpoint_interval_miles=(
+                request.checkpoint_interval_miles
+            ),
             load_weight_lb=request.load_weight_lb,
             routes=planned_routes,
             count=len(planned_routes),
@@ -215,7 +261,10 @@ async def create_route_plan(
     except WeatherServiceError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Unable to retrieve checkpoint weather: {exc}",
+            detail=(
+                "Unable to retrieve checkpoint weather: "
+                f"{exc}"
+            ),
         ) from exc
 
     except ValueError as exc:
